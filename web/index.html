@@ -1,0 +1,191 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Chronicle</title>
+  <style>
+    * { box-sizing: border-box; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; }
+    body { margin: 0; padding: 16px; background: #0c0e14; color: #d1d5db; height: 100vh; display: flex; flex-direction: column; }
+    .hidden { display: none !important; }
+    header { display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid #1f2430; padding-bottom: 10px; }
+    .auth-box { max-width: 320px; margin: 100px auto; background: #131722; padding: 24px; border-radius: 8px; border: 1px solid #1f2430; }
+    .auth-box input { width: 100%; padding: 10px; margin-bottom: 12px; background: #0c0e14; border: 1px solid #2d3345; color: #fff; border-radius: 4px; }
+    .layout { display: flex; gap: 16px; flex: 1; margin-top: 14px; overflow: hidden; }
+    .tasks-panel { width: 380px; background: #131722; border-radius: 8px; padding: 14px; display: flex; flex-direction: column; gap: 10px; border: 1px solid #1f2430; }
+    .editor-panel { flex: 1; display: flex; flex-direction: column; background: #131722; border-radius: 8px; padding: 14px; border: 1px solid #1f2430; }
+    textarea { flex: 1; background: transparent; color: #e5e7eb; border: none; resize: none; font-size: 14px; line-height: 1.6; outline: none; }
+    .btn-row { display: flex; gap: 6px; }
+    button { background: #1c2233; color: #9ca3af; border: 1px solid #2d3345; border-radius: 4px; padding: 6px 12px; cursor: pointer; font-size: 12px; }
+    button:hover { background: #2d3345; color: #fff; }
+    .btn-primary { background: #2563eb; color: #fff; border: none; width: 100%; padding: 10px; }
+    .task-item { display: flex; align-items: center; justify-content: space-between; padding: 8px 0; border-bottom: 1px solid #1f2430; font-size: 13px; }
+    .badge { font-size: 10px; padding: 2px 6px; border-radius: 4px; background: #1c2233; border: 1px solid #2d3345; }
+    .completed { text-decoration: line-through; opacity: 0.4; }
+  </style>
+</head>
+<body>
+
+  <!-- AUTH SCREEN -->
+  <div id="auth-screen" class="auth-box hidden">
+    <h3 id="auth-title">Sign In</h3>
+    <input type="text" id="auth-user" placeholder="Username" autocomplete="off" />
+    <input type="password" id="auth-pass" placeholder="Passcode" />
+    <button class="btn-primary" id="auth-btn" onclick="submitAuth()">Enter</button>
+  </div>
+
+  <!-- MAIN APP SCREEN -->
+  <div id="app-screen" class="hidden" style="display:flex; flex-direction:column; height:100%;">
+    <header>
+      <h3 id="current-date" style="margin:0;">Chronicle</h3>
+      <div class="btn-row">
+        <button onclick="downloadDay()">Export Day (.txt)</button>
+        <button onclick="logout()">Lock</button>
+      </div>
+    </header>
+
+    <div class="layout">
+      <!-- TASKS PANEL -->
+      <div class="tasks-panel">
+        <h4 style="margin:0 0 4px 0;">Tasks</h4>
+        <input type="text" id="task-input" placeholder="Add task..." style="width:100%; padding:8px; background:#0c0e14; border:1px solid #2d3345; color:#fff; border-radius:4px;" />
+        
+        <div class="btn-row">
+          <button onclick="createTask('rollover')">🔄 Keep Going</button>
+          <button onclick="createTask('daily')">📅 Today</button>
+          <button onclick="createTask('monthly')">🗓️ Month</button>
+        </div>
+
+        <div id="task-list" style="flex:1; overflow-y:auto; margin-top:8px;"></div>
+      </div>
+
+      <!-- DAILY RAW LOG -->
+      <div class="editor-panel">
+        <div style="display:flex; justify-content:space-between; margin-bottom:8px;">
+          <span style="font-size:11px; color:#6b7280;">Auto-saved text stream</span>
+          <span id="save-status" style="font-size:11px; color:#6b7280;"></span>
+        </div>
+        <textarea id="log-editor" placeholder="Write documentation, thoughts, notes..."></textarea>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    let saveTimeout = null;
+    let isConfigured = false;
+
+    async function checkAuth() {
+      const res = await fetch('/api/auth/status');
+      const data = await res.json();
+      isConfigured = data.configured;
+
+      if (!data.configured) {
+        document.getElementById('auth-title').innerText = "Initial Setup (One-Time)";
+        document.getElementById('auth-screen').classList.remove('hidden');
+      } else if (!data.logged_in) {
+        document.getElementById('auth-title').innerText = "Passcode Required";
+        document.getElementById('auth-screen').classList.remove('hidden');
+      } else {
+        document.getElementById('auth-screen').classList.add('hidden');
+        document.getElementById('app-screen').classList.remove('hidden');
+        loadData();
+      }
+    }
+
+    async function submitAuth() {
+      const username = document.getElementById('auth-user').value;
+      const password = document.getElementById('auth-pass').value;
+      const endpoint = isConfigured ? '/api/auth/login' : '/api/auth/setup';
+
+      const res = await fetch(endpoint, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ username, password })
+      });
+
+      if (res.ok) {
+        if (!isConfigured) {
+          isConfigured = true;
+          submitAuth();
+        } else {
+          document.getElementById('auth-screen').classList.add('hidden');
+          document.getElementById('app-screen').classList.remove('hidden');
+          loadData();
+        }
+      } else {
+        alert("Authentication failed.");
+      }
+    }
+
+    async function logout() {
+      await fetch('/api/auth/logout');
+      location.reload();
+    }
+
+    async function loadData() {
+      const res = await fetch('/api/today');
+      if (res.status === 401) { location.reload(); return; }
+      const data = await res.json();
+      document.getElementById('current-date').innerText = "Chronicle: " + data.date;
+      document.getElementById('log-editor').value = data.content || '';
+      renderTasks(data.tasks || []);
+    }
+
+    function renderTasks(tasks) {
+      const container = document.getElementById('task-list');
+      container.innerHTML = '';
+      tasks.forEach(t => {
+        const div = document.createElement('div');
+        div.className = 'task-item';
+        div.innerHTML = `
+          <div>
+            <input type="checkbox" ${t.is_completed ? 'checked' : ''} onchange="toggleTask(${t.id})" />
+            <span class="${t.is_completed ? 'completed' : ''}">${t.title}</span>
+            <div style="font-size:10px; color:#6b7280; margin-left:20px;">
+              Created: ${t.created_date} ${t.days_taken ? `• Took: ${t.days_taken}d` : ''}
+            </div>
+          </div>
+          <span class="badge">${t.task_type}</span>
+        `;
+        container.appendChild(div);
+      });
+    }
+
+    async function createTask(type) {
+      const input = document.getElementById('task-input');
+      if (!input.value.trim()) return;
+      await fetch('/api/tasks', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ title: input.value, task_type: type })
+      });
+      input.value = '';
+      loadData();
+    }
+
+    async function toggleTask(id) {
+      await fetch(`/api/tasks/toggle?id=${id}`);
+      loadData();
+    }
+
+    document.getElementById('log-editor').addEventListener('input', (e) => {
+      document.getElementById('save-status').innerText = 'Saving...';
+      clearTimeout(saveTimeout);
+      saveTimeout = setTimeout(async () => {
+        await fetch('/api/log', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ content: e.target.value })
+        });
+        document.getElementById('save-status').innerText = 'Saved';
+      }, 500);
+    });
+
+    function downloadDay() {
+      window.location.href = '/api/export/day';
+    }
+
+    checkAuth();
+  </script>
+</body>
+</html>
