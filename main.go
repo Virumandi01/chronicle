@@ -1,6 +1,7 @@
 package main
 
 import (
+	"archive/zip"
 	"crypto/rand"
 	"database/sql"
 	"embed"
@@ -17,8 +18,6 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-// Embed everything inside the web folder
-//
 //go:embed web/*
 var webFiles embed.FS
 
@@ -28,20 +27,9 @@ var (
 	timeZone = "Asia/Kolkata"
 )
 
-type Task struct {
-	ID            int64  `json:"id"`
-	Title         string `json:"title"`
-	TaskType      string `json:"task_type"` // 'rollover', 'daily', 'monthly'
-	TargetDate    string `json:"target_date"`
-	CreatedDate   string `json:"created_date"`
-	CompletedDate string `json:"completed_date"`
-	IsCompleted   bool   `json:"is_completed"`
-	DaysTaken     int    `json:"days_taken"`
-}
-
 func initDB() {
 	var err error
-	db, err = sql.Open("sqlite", "./chronicle.db?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)&_pragma=synchronous(NORMAL)")
+	db, err = sql.Open("sqlite", "./chronicle.db?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)")
 	if err != nil {
 		log.Fatal("DB Open Error:", err)
 	}
@@ -58,18 +46,8 @@ func initDB() {
 	);
 	CREATE TABLE IF NOT EXISTS daily_logs (
 		date TEXT PRIMARY KEY,
-		content TEXT,
+		content TEXT DEFAULT '',
 		updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
-	);
-	CREATE TABLE IF NOT EXISTS tasks (
-		id INTEGER PRIMARY KEY AUTOINCREMENT,
-		title TEXT NOT NULL,
-		task_type TEXT NOT NULL,
-		target_date TEXT,
-		created_date TEXT NOT NULL,
-		completed_date TEXT,
-		is_completed INTEGER DEFAULT 0,
-		days_taken INTEGER DEFAULT 0
 	);`
 	if _, err = db.Exec(schema); err != nil {
 		log.Fatal("DB Schema Error:", err)
@@ -115,48 +93,49 @@ func main() {
 
 	port := os.Getenv("PORT")
 	if port == "" {
-		port = "8081" // Default set to 8081
+		port = "8081"
 	}
 
-	// API Routes
+	// Auth Endpoints
 	http.HandleFunc("/api/auth/status", handleAuthStatus)
 	http.HandleFunc("/api/auth/setup", handleSetup)
 	http.HandleFunc("/api/auth/login", handleLogin)
 	http.HandleFunc("/api/auth/logout", handleLogout)
 
-	http.HandleFunc("/api/today", authMiddleware(handleToday))
+	// App Endpoints (Pure text & calendar)
+	http.HandleFunc("/api/day", authMiddleware(handleDay))
 	http.HandleFunc("/api/log", authMiddleware(handleLog))
-	http.HandleFunc("/api/tasks", authMiddleware(handleTasks))
-	http.HandleFunc("/api/tasks/toggle", authMiddleware(handleTaskToggle))
 	http.HandleFunc("/api/export/day", authMiddleware(handleExportDay))
+	http.HandleFunc("/api/export/month", authMiddleware(handleExportMonth))
+	http.HandleFunc("/api/export/year", authMiddleware(handleExportYear))
 
-	// Direct embedded filesystem root sub-tree
+	// Embedded Static UI
 	contentStatic, err := fs.Sub(webFiles, "web")
 	if err != nil {
-		log.Fatal("Failed to load embedded filesystem:", err)
+		log.Fatal("Embedded web load failed:", err)
 	}
-	fileServer := http.FileServer(http.FS(contentStatic))
-	http.Handle("/", fileServer)
+	http.Handle("/", http.FileServer(http.FS(contentStatic)))
 
-	fmt.Printf("✓ Chronicle Server running at http://0.0.0.0:%s\n", port)
+	fmt.Printf("✓ Chronicle Server active at http://0.0.0.0:%s\n", port)
 	log.Fatal(http.ListenAndServe(":"+port, nil))
 }
 
-// ---------------- HANDLERS ----------------
+// ---------------- AUTH HANDLERS ----------------
 
 func handleAuthStatus(w http.ResponseWriter, r *http.Request) {
 	var count int
-	db.QueryRow("SELECT COUNT(*) FROM auth").Scan(&count)
+	_ = db.QueryRow("SELECT COUNT(*) FROM auth").Scan(&count)
 	isConfigured := count > 0
 
 	isLoggedIn := false
 	cookie, err := r.Cookie("session_token")
 	if err == nil {
 		var exists int
-		db.QueryRow("SELECT 1 FROM sessions WHERE token = ?", cookie.Value).Scan(&exists)
+		_ = db.QueryRow("SELECT 1 FROM sessions WHERE token = ?", cookie.Value).Scan(&exists)
 		isLoggedIn = (exists == 1)
 	}
 
+	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]bool{
 		"configured": isConfigured,
 		"logged_in":  isLoggedIn,
@@ -169,14 +148,17 @@ func handleSetup(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var count int
-	db.QueryRow("SELECT COUNT(*) FROM auth").Scan(&count)
+	_ = db.QueryRow("SELECT COUNT(*) FROM auth").Scan(&count)
 	if count > 0 {
 		http.Error(w, "Already configured", 400)
 		return
 	}
 
 	var req struct{ Username, Password string }
-	json.NewDecoder(r.Body).Decode(&req)
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Username == "" || req.Password == "" {
+		http.Error(w, "Invalid input", 400)
+		return
+	}
 
 	hash, _ := bcrypt.GenerateFromPassword([]byte(req.Password), bcrypt.DefaultCost)
 	db.Exec("INSERT INTO auth (id, username, password_hash) VALUES (1, ?, ?)", req.Username, string(hash))
@@ -189,7 +171,10 @@ func handleLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req struct{ Username, Password string }
-	json.NewDecoder(r.Body).Decode(&req)
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "Invalid input", 400)
+		return
+	}
 
 	var dbUser, dbHash string
 	err := db.QueryRow("SELECT username, password_hash FROM auth WHERE id = 1").Scan(&dbUser, &dbHash)
@@ -231,38 +216,21 @@ func handleLogout(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 }
 
-func handleToday(w http.ResponseWriter, r *http.Request) {
-	today := getTodayDate()
-	currentMonth := time.Now().In(userLoc).Format("2006-01")
+// ---------------- LOG HANDLERS ----------------
 
-	var content string
-	db.QueryRow("SELECT content FROM daily_logs WHERE date = ?", today).Scan(&content)
-
-	rows, _ := db.Query(`
-		SELECT id, title, task_type, target_date, created_date, completed_date, is_completed, days_taken
-		FROM tasks
-		WHERE (task_type = 'rollover' AND (is_completed = 0 OR completed_date = ?))
-		   OR (task_type = 'daily' AND target_date = ?)
-		   OR (task_type = 'monthly' AND target_date = ?)
-	`, today, today, currentMonth)
-	defer rows.Close()
-
-	var tasks []Task
-	for rows.Next() {
-		var t Task
-		var completedDate, targetDate sql.NullString
-		var isComp int
-		rows.Scan(&t.ID, &t.Title, &t.TaskType, &targetDate, &t.CreatedDate, &completedDate, &isComp, &t.DaysTaken)
-		t.IsCompleted = (isComp == 1)
-		t.CompletedDate = completedDate.String
-		t.TargetDate = targetDate.String
-		tasks = append(tasks, t)
+func handleDay(w http.ResponseWriter, r *http.Request) {
+	date := r.URL.Query().Get("date")
+	if date == "" {
+		date = getTodayDate()
 	}
 
+	var content string
+	_ = db.QueryRow("SELECT content FROM daily_logs WHERE date = ?", date).Scan(&content)
+
+	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{
-		"date":    today,
+		"date":    date,
 		"content": content,
-		"tasks":   tasks,
 	})
 }
 
@@ -271,61 +239,22 @@ func handleLog(w http.ResponseWriter, r *http.Request) {
 		Date    string `json:"date"`
 		Content string `json:"content"`
 	}
-	json.NewDecoder(r.Body).Decode(&req)
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "Invalid input", 400)
+		return
+	}
 	if req.Date == "" {
 		req.Date = getTodayDate()
 	}
 
-	db.Exec(`
+	_, err := db.Exec(`
 		INSERT INTO daily_logs (date, content, updated_at) VALUES (?, ?, CURRENT_TIMESTAMP)
 		ON CONFLICT(date) DO UPDATE SET content = excluded.content, updated_at = CURRENT_TIMESTAMP
 	`, req.Date, req.Content)
-	w.WriteHeader(http.StatusOK)
-}
 
-func handleTasks(w http.ResponseWriter, r *http.Request) {
-	if r.Method == http.MethodPost {
-		var t Task
-		json.NewDecoder(r.Body).Decode(&t)
-		today := getTodayDate()
-		t.CreatedDate = today
-
-		if t.TaskType == "daily" {
-			t.TargetDate = today
-		} else if t.TaskType == "monthly" {
-			t.TargetDate = time.Now().In(userLoc).Format("2006-01")
-		}
-
-		db.Exec(`
-			INSERT INTO tasks (title, task_type, target_date, created_date, is_completed)
-			VALUES (?, ?, ?, ?, 0)
-		`, t.Title, t.TaskType, t.TargetDate, t.CreatedDate)
-		w.WriteHeader(http.StatusCreated)
-	}
-}
-
-func handleTaskToggle(w http.ResponseWriter, r *http.Request) {
-	id := r.URL.Query().Get("id")
-	today := getTodayDate()
-
-	var createdDateStr string
-	var isCompleted int
-	err := db.QueryRow("SELECT created_date, is_completed FROM tasks WHERE id = ?", id).Scan(&createdDateStr, &isCompleted)
 	if err != nil {
-		http.Error(w, "Not found", 404)
+		http.Error(w, err.Error(), 500)
 		return
-	}
-
-	if isCompleted == 0 {
-		createdDate, _ := time.Parse("2006-01-02", createdDateStr)
-		todayDate, _ := time.Parse("2006-01-02", today)
-		daysTaken := int(todayDate.Sub(createdDate).Hours() / 24)
-		if daysTaken < 0 {
-			daysTaken = 0
-		}
-		db.Exec(`UPDATE tasks SET is_completed = 1, completed_date = ?, days_taken = ? WHERE id = ?`, today, daysTaken, id)
-	} else {
-		db.Exec(`UPDATE tasks SET is_completed = 0, completed_date = NULL, days_taken = 0 WHERE id = ?`, id)
 	}
 	w.WriteHeader(http.StatusOK)
 }
@@ -335,10 +264,62 @@ func handleExportDay(w http.ResponseWriter, r *http.Request) {
 	if date == "" {
 		date = getTodayDate()
 	}
+
 	var content string
-	db.QueryRow("SELECT content FROM daily_logs WHERE date = ?", date).Scan(&content)
+	_ = db.QueryRow("SELECT content FROM daily_logs WHERE date = ?", date).Scan(&content)
 
 	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%s.txt", date))
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 	w.Write([]byte(content))
+}
+
+func handleExportMonth(w http.ResponseWriter, r *http.Request) {
+	month := r.URL.Query().Get("month")
+	if month == "" && len(getTodayDate()) >= 7 {
+		month = getTodayDate()[:7]
+	}
+
+	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=Chronicle_%s.zip", month))
+	w.Header().Set("Content-Type", "application/zip")
+
+	zw := zip.NewWriter(w)
+	defer zw.Close()
+
+	rows, err := db.Query("SELECT date, content FROM daily_logs WHERE strftime('%Y-%m', date) = ?", month)
+	if err == nil && rows != nil {
+		defer rows.Close()
+		for rows.Next() {
+			var d, content string
+			if err := rows.Scan(&d, &content); err == nil && d != "" {
+				f, _ := zw.Create(fmt.Sprintf("%s/%s.txt", month, d))
+				f.Write([]byte(content))
+			}
+		}
+	}
+}
+
+func handleExportYear(w http.ResponseWriter, r *http.Request) {
+	year := r.URL.Query().Get("year")
+	if year == "" && len(getTodayDate()) >= 4 {
+		year = getTodayDate()[:4]
+	}
+
+	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=Chronicle_%s.zip", year))
+	w.Header().Set("Content-Type", "application/zip")
+
+	zw := zip.NewWriter(w)
+	defer zw.Close()
+
+	rows, err := db.Query("SELECT date, content FROM daily_logs WHERE strftime('%Y', date) = ?", year)
+	if err == nil && rows != nil {
+		defer rows.Close()
+		for rows.Next() {
+			var d, content string
+			if err := rows.Scan(&d, &content); err == nil && len(d) >= 7 {
+				month := d[:7]
+				f, _ := zw.Create(fmt.Sprintf("%s/%s/%s.txt", year, month, d))
+				f.Write([]byte(content))
+			}
+		}
+	}
 }
