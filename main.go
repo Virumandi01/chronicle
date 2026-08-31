@@ -27,6 +27,18 @@ var (
 	timeZone = "Asia/Kolkata"
 )
 
+type Task struct {
+	ID            int64  `json:"id"`
+	Title         string `json:"title"`
+	Description   string `json:"description"`
+	TaskType      string `json:"task_type"` // 'until_finished', 'daily', 'monthly'
+	TargetDate    string `json:"target_date"`
+	CreatedDate   string `json:"created_date"`
+	CompletedDate string `json:"completed_date"`
+	IsCompleted   bool   `json:"is_completed"`
+	DaysTaken     int    `json:"days_taken"`
+}
+
 func initDB() {
 	var err error
 	db, err = sql.Open("sqlite", "./chronicle.db?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)")
@@ -48,6 +60,17 @@ func initDB() {
 		date TEXT PRIMARY KEY,
 		content TEXT DEFAULT '',
 		updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+	);
+	CREATE TABLE IF NOT EXISTS tasks (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		title TEXT NOT NULL,
+		description TEXT DEFAULT '',
+		task_type TEXT NOT NULL,
+		target_date TEXT,
+		created_date TEXT NOT NULL,
+		completed_date TEXT,
+		is_completed INTEGER DEFAULT 0,
+		days_taken INTEGER DEFAULT 0
 	);`
 	if _, err = db.Exec(schema); err != nil {
 		log.Fatal("DB Schema Error:", err)
@@ -102,14 +125,16 @@ func main() {
 	http.HandleFunc("/api/auth/login", handleLogin)
 	http.HandleFunc("/api/auth/logout", handleLogout)
 
-	// App Endpoints (Pure text & calendar)
+	// Log & Task Endpoints
 	http.HandleFunc("/api/day", authMiddleware(handleDay))
 	http.HandleFunc("/api/log", authMiddleware(handleLog))
+	http.HandleFunc("/api/tasks", authMiddleware(handleTasks))
+	http.HandleFunc("/api/tasks/finish", authMiddleware(handleTaskFinish))
 	http.HandleFunc("/api/export/day", authMiddleware(handleExportDay))
 	http.HandleFunc("/api/export/month", authMiddleware(handleExportMonth))
 	http.HandleFunc("/api/export/year", authMiddleware(handleExportYear))
 
-	// Embedded Static UI
+	// Static UI
 	contentStatic, err := fs.Sub(webFiles, "web")
 	if err != nil {
 		log.Fatal("Embedded web load failed:", err)
@@ -216,21 +241,54 @@ func handleLogout(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 }
 
-// ---------------- LOG HANDLERS ----------------
+// ---------------- DATA & TASK HANDLERS ----------------
 
 func handleDay(w http.ResponseWriter, r *http.Request) {
 	date := r.URL.Query().Get("date")
 	if date == "" {
 		date = getTodayDate()
 	}
+	yearMonth := date
+	if len(date) >= 7 {
+		yearMonth = date[:7]
+	}
 
 	var content string
 	_ = db.QueryRow("SELECT content FROM daily_logs WHERE date = ?", date).Scan(&content)
+
+	activeTasks := []Task{}
+
+	// Active Tasks Query
+	rows, err := db.Query(`
+		SELECT id, title, description, task_type, target_date, created_date, completed_date, is_completed, days_taken
+		FROM tasks
+		WHERE (is_completed = 0 AND (
+		   (task_type = 'until_finished' AND created_date <= ?)
+		   OR (task_type = 'daily' AND (target_date = ? OR created_date = ?))
+		   OR (task_type = 'monthly' AND strftime('%Y-%m', created_date) = ? AND created_date <= ?)
+		)) OR (is_completed = 1 AND completed_date = ?)
+	`, date, date, date, yearMonth, date, date)
+
+	if err == nil && rows != nil {
+		defer rows.Close()
+		for rows.Next() {
+			var t Task
+			var completedDate, targetDate sql.NullString
+			var isComp int
+			if err := rows.Scan(&t.ID, &t.Title, &t.Description, &t.TaskType, &targetDate, &t.CreatedDate, &completedDate, &isComp, &t.DaysTaken); err == nil {
+				t.IsCompleted = (isComp == 1)
+				t.CompletedDate = completedDate.String
+				t.TargetDate = targetDate.String
+				activeTasks = append(activeTasks, t)
+			}
+		}
+	}
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"date":    date,
 		"content": content,
+		"tasks":   activeTasks,
 	})
 }
 
@@ -257,6 +315,71 @@ func handleLog(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.WriteHeader(http.StatusOK)
+}
+
+func handleTasks(w http.ResponseWriter, r *http.Request) {
+	if r.Method == http.MethodPost {
+		var t Task
+		if err := json.NewDecoder(r.Body).Decode(&t); err != nil {
+			http.Error(w, "Invalid input", 400)
+			return
+		}
+		if t.CreatedDate == "" {
+			t.CreatedDate = getTodayDate()
+		}
+
+		if t.TaskType == "daily" && t.TargetDate == "" {
+			t.TargetDate = t.CreatedDate
+		} else if t.TaskType == "monthly" && t.TargetDate == "" && len(t.CreatedDate) >= 7 {
+			t.TargetDate = t.CreatedDate[:7]
+		}
+
+		res, err := db.Exec(`
+			INSERT INTO tasks (title, description, task_type, target_date, created_date, is_completed)
+			VALUES (?, ?, ?, ?, ?, 0)
+		`, t.Title, t.Description, t.TaskType, t.TargetDate, t.CreatedDate)
+		if err != nil {
+			http.Error(w, err.Error(), 500)
+			return
+		}
+
+		id, _ := res.LastInsertId()
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]int64{"id": id})
+	}
+}
+
+func handleTaskFinish(w http.ResponseWriter, r *http.Request) {
+	id := r.URL.Query().Get("id")
+	finishDate := r.URL.Query().Get("date")
+	if finishDate == "" {
+		finishDate = getTodayDate()
+	}
+
+	var createdDateStr string
+	var title, desc, taskType string
+	err := db.QueryRow("SELECT title, description, task_type, created_date FROM tasks WHERE id = ?", id).Scan(&title, &desc, &taskType, &createdDateStr)
+	if err != nil {
+		http.Error(w, "Not found", 404)
+		return
+	}
+
+	createdDate, _ := time.Parse("2006-01-02", createdDateStr)
+	actionDate, _ := time.Parse("2006-01-02", finishDate)
+	daysTaken := int(actionDate.Sub(createdDate).Hours() / 24)
+	if daysTaken < 0 {
+		daysTaken = 0
+	}
+
+	db.Exec(`UPDATE tasks SET is_completed = 1, completed_date = ?, days_taken = ? WHERE id = ?`, finishDate, daysTaken, id)
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"title":        title,
+		"created_date": createdDateStr,
+		"days_taken":   daysTaken,
+		"finish_date":  finishDate,
+	})
 }
 
 func handleExportDay(w http.ResponseWriter, r *http.Request) {

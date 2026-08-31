@@ -13,7 +13,7 @@
     .auth-box { max-width: 320px; margin: 100px auto; background: #121722; padding: 24px; border-radius: 8px; border: 1px solid #1c2333; }
     .auth-box input { width: 100%; padding: 10px; margin-bottom: 12px; background: #0b0d13; border: 1px solid #2a3449; color: #fff; border-radius: 4px; }
     
-    .main-grid { display: grid; grid-template-columns: 260px 300px 1fr; gap: 12px; flex: 1; margin-top: 10px; overflow: hidden; }
+    .main-grid { display: grid; grid-template-columns: 260px 320px 1fr; gap: 12px; flex: 1; margin-top: 10px; overflow: hidden; }
     .panel { background: #121722; border-radius: 8px; padding: 12px; border: 1px solid #1c2333; display: flex; flex-direction: column; }
     
     /* Calendar */
@@ -27,12 +27,24 @@
     .cal-day.empty { background: transparent; cursor: default; }
 
     /* Inputs & Buttons */
-    input, textarea { background: #0b0d13; border: 1px solid #2a3449; color: #e5e7eb; border-radius: 4px; padding: 8px; font-size: 12px; }
-    textarea { resize: none; outline: none; line-height: 1.6; font-size: 13px; }
+    input, textarea { background: #0b0d13; border: 1px solid #2a3449; color: #e5e7eb; border-radius: 4px; padding: 6px; font-size: 12px; }
+    textarea { resize: none; outline: none; line-height: 1.5; font-size: 13px; }
     .btn-row { display: flex; gap: 4px; flex-wrap: wrap; }
-    button { background: #1a2233; color: #9ca3af; border: 1px solid #2a3449; border-radius: 4px; padding: 6px 10px; cursor: pointer; font-size: 11px; }
+    button { background: #1a2233; color: #9ca3af; border: 1px solid #2a3449; border-radius: 4px; padding: 5px 10px; cursor: pointer; font-size: 11px; }
     button:hover { background: #2a3449; color: #fff; }
     .btn-primary { background: #2563eb; color: #fff; border: none; }
+    .btn-finish { background: #059669; color: #fff; border: none; padding: 6px 12px; font-weight: bold; border-radius: 4px; }
+    .btn-finish:hover { background: #10b981; }
+
+    /* Task Menu List */
+    .task-card { background: #0b0d13; border: 1px solid #1c2333; border-radius: 4px; padding: 8px; margin-bottom: 6px; cursor: pointer; transition: 0.15s; }
+    .task-card:hover { border-color: #3b82f6; }
+    .task-card-title { font-size: 12px; font-weight: bold; color: #f3f4f6; display: flex; justify-content: space-between; }
+    .badge { font-size: 9px; padding: 2px 5px; border-radius: 3px; background: #1c2333; border: 1px solid #2a3449; }
+
+    /* Info Modal Box */
+    .modal-overlay { position: fixed; inset: 0; background: rgba(0,0,0,0.75); display: flex; align-items: center; justify-content: center; z-index: 100; }
+    .modal-box { background: #121722; border: 1px solid #2a3449; border-radius: 8px; width: 400px; padding: 18px; box-shadow: 0 10px 25px rgba(0,0,0,0.5); }
   </style>
 </head>
 <body>
@@ -76,28 +88,26 @@
         </div>
       </div>
 
-      <!-- MIDDLE: TASK INSERTER -->
+      <!-- MIDDLE: TASK MENU -->
       <div class="panel">
-        <h4 style="margin:0 0 6px 0;">Append Task</h4>
-        <span style="font-size:11px; color:#6b7280; margin-bottom:8px;">Pastes 40 lines below text with separator:</span>
-        <input type="text" id="task-title" placeholder="Task Heading..." style="margin-bottom:6px;" />
-        <textarea id="task-desc" placeholder="Task content / details..." style="height:120px; margin-bottom:8px;"></textarea>
+        <h4 style="margin:0 0 6px 0;">Task Menu</h4>
+        <input type="text" id="task-title" placeholder="Task Name..." style="margin-bottom:4px;" />
+        <textarea id="task-desc" placeholder="Details / notes..." style="height:60px; margin-bottom:6px;"></textarea>
         
-        <div class="btn-row">
-          <button onclick="insertTask('KEEP GOING')">🔄 Keep Going</button>
-          <button onclick="insertTask('DAY TASK')">📅 Today</button>
-          <button onclick="insertTask('MONTH TASK')">🗓️ Month</button>
+        <div class="btn-row" style="margin-bottom:10px;">
+          <button onclick="createTask('until_finished', 'Until Finished')">🔄 Until Finished</button>
+          <button onclick="createTask('daily', 'Day Task')">📅 Day Task</button>
+          <button onclick="createTask('monthly', 'Month Task')">🗓️ Month Task</button>
         </div>
 
-        <div style="margin-top:auto; font-size:11px; color:#4b5563; line-height:1.4;">
-          * Tasks are written directly inside the raw text. To delete, just erase them from the editor.
-        </div>
+        <div style="font-size:11px; color:#6b7280; margin-bottom:6px;">Active Tracking (Click for info):</div>
+        <div id="task-menu-list" style="flex:1; overflow-y:auto;"></div>
       </div>
 
       <!-- RIGHT: RAW TEXT LOG -->
       <div class="panel" style="flex:1;">
         <div style="display:flex; justify-content:space-between; margin-bottom:6px;">
-          <span style="font-size:11px; color:#6b7280;">Daily Raw Documentation</span>
+          <span style="font-size:11px; color:#6b7280;">Daily Documentation Stream</span>
           <span id="save-status" style="font-size:11px; color:#6b7280;"></span>
         </div>
         <textarea id="log-editor" style="flex:1;" placeholder="Write documentation, thoughts, notes..."></textarea>
@@ -106,11 +116,31 @@
     </div>
   </div>
 
+  <!-- TASK DETAIL & FINISH MODAL -->
+  <div id="task-modal" class="modal-overlay hidden">
+    <div class="modal-box">
+      <div style="display:flex; justify-content:space-between; align-items:flex-start; margin-bottom:10px;">
+        <h3 id="modal-task-title" style="margin:0; font-size:15px; color:#60a5fa;"></h3>
+        <span id="modal-task-badge" class="badge"></span>
+      </div>
+      <div style="font-size:11px; color:#9ca3af; margin-bottom:10px;" id="modal-task-started"></div>
+      
+      <div style="background:#0b0d13; padding:10px; border-radius:4px; font-size:12px; color:#d1d5db; min-height:80px; margin-bottom:14px; white-space:pre-wrap; border:1px solid #1c2333;" id="modal-task-desc"></div>
+      
+      <div style="display:flex; justify-content:space-between; align-items:center;">
+        <button onclick="closeModal()">Close</button>
+        <button id="modal-finish-btn" class="btn-finish" onclick="finishCurrentTask()">✓ Finish Task</button>
+      </div>
+    </div>
+  </div>
+
   <script>
     let currentDate = new Date();
     let selectedDateStr = "";
     let isConfigured = false;
     let saveTimeout = null;
+    let currentTasks = [];
+    let activeModalTask = null;
 
     function formatDate(d) {
       return d.toISOString().split('T')[0];
@@ -225,32 +255,120 @@
       const res = await fetch(`/api/day?date=${selectedDateStr}`);
       if (res.status === 401) { location.reload(); return; }
       const data = await res.json();
+      
       document.getElementById('log-editor').value = data.content || '';
+      currentTasks = data.tasks || [];
+      renderTaskMenu();
     }
 
-    // Exact format: 40 lines below last word, separator, 2 blank lines, Heading & Content
-    function insertTask(typeLabel) {
+    function renderTaskMenu() {
+      const container = document.getElementById('task-menu-list');
+      container.innerHTML = '';
+
+      if (currentTasks.length === 0) {
+        container.innerHTML = '<span style="font-size:11px; color:#4b5563;">No tasks for this day.</span>';
+        return;
+      }
+
+      currentTasks.forEach(t => {
+        const item = document.createElement('div');
+        item.className = 'task-card';
+        const typeDisplay = t.task_type === 'until_finished' ? 'Until Finished' : (t.task_type === 'daily' ? 'Day' : 'Month');
+        
+        item.innerHTML = `
+          <div class="task-card-title">
+            <span>${t.is_completed ? '✓ ' : ''}${t.title}</span>
+            <span class="badge">${typeDisplay}</span>
+          </div>
+          <div style="font-size:10px; color:#6b7280; margin-top:4px;">
+            Started: ${t.created_date} ${t.is_completed ? `• Finished on this date (Took ${t.days_taken}d)` : ''}
+          </div>
+        `;
+        item.onclick = () => openModal(t);
+        container.appendChild(item);
+      });
+    }
+
+    // Modal Operations
+    function openModal(task) {
+      activeModalTask = task;
+      document.getElementById('modal-task-title').innerText = task.title;
+      const typeDisplay = task.task_type === 'until_finished' ? 'Until Finished' : (task.task_type === 'daily' ? 'Day Task' : 'Month Task');
+      document.getElementById('modal-task-badge').innerText = typeDisplay;
+      document.getElementById('modal-task-started').innerText = `Day Started: ${task.created_date}`;
+      document.getElementById('modal-task-desc').innerText = task.description || '(No additional details provided)';
+      
+      const finishBtn = document.getElementById('modal-finish-btn');
+      if (task.is_completed) {
+        finishBtn.style.display = 'none';
+      } else {
+        finishBtn.style.display = 'block';
+      }
+
+      document.getElementById('task-modal').classList.remove('hidden');
+    }
+
+    function closeModal() {
+      document.getElementById('task-modal').classList.add('hidden');
+      activeModalTask = null;
+    }
+
+    // Create Task (Inserts to DB and Appends to Text with 40-line gap)
+    async function createTask(typeKey, typeLabel) {
       const title = document.getElementById('task-title').value.trim();
       const desc = document.getElementById('task-desc').value.trim();
       if (!title) return;
 
+      // 1. Save to Database for Task Menu Tracking
+      await fetch('/api/tasks', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          title: title,
+          description: desc,
+          task_type: typeKey,
+          created_date: selectedDateStr,
+          target_date: selectedDateStr
+        })
+      });
+
+      // 2. Append directly to Text File (40 blank lines + separator + 2 lines)
       const editor = document.getElementById('log-editor');
       let currentVal = editor.value;
       const separator = "===========================================================";
 
       if (!currentVal.includes(separator)) {
-        // 40 blank lines below last word
         const fortyBlankLines = "\n".repeat(40);
-        editor.value = (currentVal ? currentVal : "") + fortyBlankLines + separator + "\n\n\n[" + typeLabel + "] " + title + "\n\n" + desc + "\n";
+        editor.value = (currentVal ? currentVal : "") + fortyBlankLines + separator + "\n\n\n[" + typeLabel.toUpperCase() + "] " + title + "\n\n" + desc + "\n";
       } else {
-        // Separator already exists, append task with 2 blank lines separation
-        editor.value = currentVal + "\n\n[" + typeLabel + "] " + title + "\n\n" + desc + "\n";
+        editor.value = currentVal + "\n\n[" + typeLabel.toUpperCase() + "] " + title + "\n\n" + desc + "\n";
       }
 
       document.getElementById('task-title').value = '';
       document.getElementById('task-desc').value = '';
 
       triggerAutoSave();
+      loadDayData();
+    }
+
+    // Finish Task & Print Completion Banner to Text File
+    async function finishCurrentTask() {
+      if (!activeModalTask) return;
+
+      const res = await fetch(`/api/tasks/finish?id=${activeModalTask.id}&date=${selectedDateStr}`);
+      const data = await res.json();
+
+      // Append completion record to today's text
+      const editor = document.getElementById('log-editor');
+      let currentVal = editor.value;
+      const separator = "=".repeat(80);
+      const finishBlock = `\n\n${separator}\n[COMPLETED] ${data.title}\nCreated: ${data.created_date} | Completed: ${data.finish_date} (Took ${data.days_taken} days)\n"Good job !"\n`;
+
+      editor.value = currentVal + finishBlock;
+
+      closeModal();
+      triggerAutoSave();
+      loadDayData();
     }
 
     function triggerAutoSave() {
