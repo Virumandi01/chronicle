@@ -12,6 +12,10 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
+	"sync"
 	"time"
 
 	"golang.org/x/crypto/bcrypt"
@@ -22,16 +26,25 @@ import (
 var webFiles embed.FS
 
 var (
-	db       *sql.DB
-	userLoc  *time.Location
-	timeZone = "Asia/Kolkata"
+	db             *sql.DB
+	userLoc        *time.Location
+	timeZone       = "Asia/Kolkata"
+	currentPairPIN string
+	pinMutex       sync.Mutex
 )
+
+type Project struct {
+	ID        int64  `json:"id"`
+	Name      string `json:"name"`
+	Path      string `json:"path"`
+	CreatedAt string `json:"created_at"`
+}
 
 type Task struct {
 	ID            int64  `json:"id"`
 	Title         string `json:"title"`
 	Description   string `json:"description"`
-	TaskType      string `json:"task_type"` // 'until_finished', 'daily', 'monthly'
+	TaskType      string `json:"task_type"`
 	TargetDate    string `json:"target_date"`
 	CreatedDate   string `json:"created_date"`
 	CompletedDate string `json:"completed_date"`
@@ -71,6 +84,12 @@ func initDB() {
 		completed_date TEXT,
 		is_completed INTEGER DEFAULT 0,
 		days_taken INTEGER DEFAULT 0
+	);
+	CREATE TABLE IF NOT EXISTS projects (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		name TEXT NOT NULL,
+		path TEXT NOT NULL,
+		created_at DATETIME DEFAULT CURRENT_TIMESTAMP
 	);`
 	if _, err = db.Exec(schema); err != nil {
 		log.Fatal("DB Schema Error:", err)
@@ -134,7 +153,11 @@ func main() {
 	http.HandleFunc("/api/export/month", authMiddleware(handleExportMonth))
 	http.HandleFunc("/api/export/year", authMiddleware(handleExportYear))
 
-	// Static UI
+	// Project & Git Analyser Endpoints
+	http.HandleFunc("/api/projects", authMiddleware(handleProjects))
+	http.HandleFunc("/api/git/analyze", authMiddleware(handleGitAnalyze))
+
+	// Embedded UI
 	contentStatic, err := fs.Sub(webFiles, "web")
 	if err != nil {
 		log.Fatal("Embedded web load failed:", err)
@@ -145,7 +168,100 @@ func main() {
 	log.Fatal(http.ListenAndServe(":"+port, nil))
 }
 
-// ---------------- AUTH HANDLERS ----------------
+// ---------------- PROJECT & GIT ANALYSER HANDLERS ----------------
+
+func handleProjects(w http.ResponseWriter, r *http.Request) {
+	if r.Method == http.MethodGet {
+		rows, err := db.Query("SELECT id, name, path, created_at FROM projects ORDER BY id DESC")
+		if err != nil {
+			http.Error(w, "Database error", 500)
+			return
+		}
+		defer rows.Close()
+
+		projects := []Project{}
+		for rows.Next() {
+			var p Project
+			rows.Scan(&p.ID, &p.Name, &p.Path, &p.CreatedAt)
+			projects = append(projects, p)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(projects)
+		return
+	}
+
+	if r.Method == http.MethodPost {
+		var req struct {
+			Name string `json:"name"`
+			Path string `json:"path"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Name == "" || req.Path == "" {
+			http.Error(w, "Name and valid folder path are required", 400)
+			return
+		}
+
+		// Normalize OS path
+		cleanPath := filepath.Clean(req.Path)
+		gitFolder := filepath.Join(cleanPath, ".git")
+		if _, err := os.Stat(gitFolder); os.IsNotExist(err) {
+			http.Error(w, "No valid .git repository found in this folder", 400)
+			return
+		}
+
+		_, err := db.Exec("INSERT INTO projects (name, path) VALUES (?, ?)", req.Name, cleanPath)
+		if err != nil {
+			http.Error(w, err.Error(), 500)
+			return
+		}
+		w.WriteHeader(http.StatusCreated)
+	}
+}
+
+func handleGitAnalyze(w http.ResponseWriter, r *http.Request) {
+	projectID := r.URL.Query().Get("project_id")
+	targetDate := r.URL.Query().Get("date")
+	if targetDate == "" {
+		targetDate = getTodayDate()
+	}
+
+	var name, repoPath string
+	err := db.QueryRow("SELECT name, path FROM projects WHERE id = ?", projectID).Scan(&name, &repoPath)
+	if err != nil {
+		http.Error(w, "Project not found", 404)
+		return
+	}
+
+	// Calculate 24-hour boundary for the day
+	since := targetDate + " 00:00:00"
+	until := targetDate + " 23:59:59"
+
+	// Read-only Git command execution
+	cmd := exec.Command("git", "-C", repoPath, "log",
+		"--since="+since,
+		"--until="+until,
+		"--pretty=format:* [%h] %s (%an, %ar)",
+	)
+
+	out, err := cmd.Output()
+	if err != nil {
+		http.Error(w, "Git analysis failed: "+err.Error(), 500)
+		return
+	}
+
+	commitSummary := strings.TrimSpace(string(out))
+	if commitSummary == "" {
+		commitSummary = "No git commits found on this date."
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{
+		"project_name": name,
+		"date":         targetDate,
+		"commits":      commitSummary,
+	})
+}
+
+// ---------------- EXISTING AUTH & DATA HANDLERS ----------------
 
 func handleAuthStatus(w http.ResponseWriter, r *http.Request) {
 	var count int
@@ -221,7 +337,7 @@ func handleLogin(w http.ResponseWriter, r *http.Request) {
 		Value:    token,
 		Path:     "/",
 		HttpOnly: true,
-		SameSite: http.SameSiteStrictMode,
+		SameSite: http.SameSiteLaxMode, // Safari compatible
 	})
 	w.WriteHeader(http.StatusOK)
 }
@@ -241,8 +357,6 @@ func handleLogout(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 }
 
-// ---------------- DATA & TASK HANDLERS ----------------
-
 func handleDay(w http.ResponseWriter, r *http.Request) {
 	date := r.URL.Query().Get("date")
 	if date == "" {
@@ -257,8 +371,6 @@ func handleDay(w http.ResponseWriter, r *http.Request) {
 	_ = db.QueryRow("SELECT content FROM daily_logs WHERE date = ?", date).Scan(&content)
 
 	activeTasks := []Task{}
-
-	// Active Tasks Query
 	rows, err := db.Query(`
 		SELECT id, title, description, task_type, target_date, created_date, completed_date, is_completed, days_taken
 		FROM tasks
@@ -334,18 +446,11 @@ func handleTasks(w http.ResponseWriter, r *http.Request) {
 			t.TargetDate = t.CreatedDate[:7]
 		}
 
-		res, err := db.Exec(`
+		db.Exec(`
 			INSERT INTO tasks (title, description, task_type, target_date, created_date, is_completed)
 			VALUES (?, ?, ?, ?, ?, 0)
 		`, t.Title, t.Description, t.TaskType, t.TargetDate, t.CreatedDate)
-		if err != nil {
-			http.Error(w, err.Error(), 500)
-			return
-		}
-
-		id, _ := res.LastInsertId()
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]int64{"id": id})
+		w.WriteHeader(http.StatusCreated)
 	}
 }
 
@@ -357,8 +462,8 @@ func handleTaskFinish(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var createdDateStr string
-	var title, desc, taskType string
-	err := db.QueryRow("SELECT title, description, task_type, created_date FROM tasks WHERE id = ?", id).Scan(&title, &desc, &taskType, &createdDateStr)
+	var title string
+	err := db.QueryRow("SELECT title, created_date FROM tasks WHERE id = ?", id).Scan(&title, &createdDateStr)
 	if err != nil {
 		http.Error(w, "Not found", 404)
 		return
@@ -387,7 +492,6 @@ func handleExportDay(w http.ResponseWriter, r *http.Request) {
 	if date == "" {
 		date = getTodayDate()
 	}
-
 	var content string
 	_ = db.QueryRow("SELECT content FROM daily_logs WHERE date = ?", date).Scan(&content)
 
@@ -401,7 +505,6 @@ func handleExportMonth(w http.ResponseWriter, r *http.Request) {
 	if month == "" && len(getTodayDate()) >= 7 {
 		month = getTodayDate()[:7]
 	}
-
 	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=Chronicle_%s.zip", month))
 	w.Header().Set("Content-Type", "application/zip")
 
@@ -426,7 +529,6 @@ func handleExportYear(w http.ResponseWriter, r *http.Request) {
 	if year == "" && len(getTodayDate()) >= 4 {
 		year = getTodayDate()[:4]
 	}
-
 	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=Chronicle_%s.zip", year))
 	w.Header().Set("Content-Type", "application/zip")
 
